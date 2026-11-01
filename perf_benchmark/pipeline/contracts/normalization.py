@@ -5,8 +5,10 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
+import math
 from typing import Any
 
+import orjson
 import pyarrow as pa
 
 from perf_benchmark.core.models import ContextMode, InputKind, Metadata
@@ -275,6 +277,36 @@ def combine_tokens(*values: TokenValue) -> TokenValue:
 
 def compact_json_text(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def compact_json_bytes(value: object) -> bytes:
+    """Encode ordinary JSON quickly, preserving the stdlib fallback contract."""
+    pending = [value]
+    seen = set()
+    while pending:
+        item = pending.pop()
+        kind = type(item)
+        if kind is dict:
+            marker = id(item)
+            if marker in seen or any(type(key) is not str for key in item):
+                return compact_json_text(value).encode()
+            seen.add(marker)
+            pending.extend(item.values())
+        elif kind in (list, tuple):
+            marker = id(item)
+            if marker in seen:
+                return compact_json_text(value).encode()
+            seen.add(marker)
+            pending.extend(item)
+        elif kind is float:
+            if not math.isfinite(item):
+                return compact_json_text(value).encode()
+        elif kind not in (str, int, bool, type(None)):
+            return compact_json_text(value).encode()
+    try:
+        return orjson.dumps(value)
+    except orjson.JSONEncodeError:
+        return compact_json_text(value).encode()
 
 
 def required_text(record: Mapping[str, Any], name: str) -> str:

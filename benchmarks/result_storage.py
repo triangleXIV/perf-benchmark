@@ -33,7 +33,7 @@ def prepared_batches(count, identity_order="random", batch_size=100, diagnostics
     output = []
     runtime = SaverRuntime.__new__(SaverRuntime)
     runtime.run = Run(id="run", name="storage-capacity")
-    runtime.writer = SimpleNamespace(submit_many=output.extend)
+    runtime.writer = SimpleNamespace(submit_many_wait=output.extend)
     processor = _MetricProcessor(StandardMetrics({}).create_backend(seed=1))
     processor.open()
     directory = Path(processor.backend.temporary.name)

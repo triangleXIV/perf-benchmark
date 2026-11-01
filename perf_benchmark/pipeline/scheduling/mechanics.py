@@ -7,7 +7,7 @@ from perf_benchmark.core.validation import positive_int, positive_number
 import asyncio
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import random
 import math
 from time import perf_counter_ns
@@ -167,6 +167,7 @@ class AttemptTicket:
     target_ns: int
     offered_ns: int
     queued: bool = True
+    at_head: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @dataclass(slots=True)
@@ -201,7 +202,7 @@ class BoundedAttemptGate:
         self.reuse_session_arrival = reuse_session_arrival
         self.semaphore = asyncio.Semaphore(concurrency) if concurrency is not None else None
         self.queue: deque[AttemptTicket] = deque()
-        self.changed = asyncio.Condition()
+        self.lock = asyncio.Lock()
         self.failure: SchedulerOverloaded | None = None
         self.failed = asyncio.Event()
         self.offered = self.admitted = self.completed = 0
@@ -219,29 +220,33 @@ class BoundedAttemptGate:
         )
         if self.deadline_ns is not None and arrival.offered_ns >= self.deadline_ns:
             raise SchedulingStopped("duration_elapsed")
-        async with self.changed:
+        async with self.lock:
             if len(self.queue) >= self.capacity:
                 self.failure = SchedulerOverloaded(
                     f"Attempt pending queue exceeded max_pending_requests={self.capacity}"
                 )
                 self.failed.set()
-                self.changed.notify_all()
                 raise SchedulingStopped("attempt_pending_overflow")
             ticket = AttemptTicket(arrival.target_ns, arrival.offered_ns)
             self.queue.append(ticket)
+            if len(self.queue) == 1:
+                ticket.at_head.set()
             self.offered += 1
             self.last_offered_ns = arrival.offered_ns
-            self.changed.notify_all()
             return ticket
 
     async def admit(self, ticket: TicketIdentity) -> AttemptLease:
         ticket = cast(AttemptTicket, ticket)
-        async with self.changed:
-            await self.changed.wait_for(lambda: not ticket.queued or self.queue[0] is ticket)
+        # Only the next eligible ticket wakes. Broadcasting every queue change
+        # to thousands of pending requests makes FIFO admission quadratic.
+        await ticket.at_head.wait()
+        async with self.lock:
             if ticket.queued:
+                assert self.queue[0] is ticket
                 self.queue.popleft()
                 ticket.queued = False
-                self.changed.notify_all()
+                if self.queue:
+                    self.queue[0].at_head.set()
         if self.semaphore is not None:
             await self.semaphore.acquire()
         self.admitted += 1
@@ -255,11 +260,14 @@ class BoundedAttemptGate:
 
     async def cancel(self, ticket: TicketIdentity) -> None:
         ticket = cast(AttemptTicket, ticket)
-        async with self.changed:
+        async with self.lock:
             if ticket.queued:
+                was_head = self.queue[0] is ticket
                 self.queue.remove(ticket)
                 ticket.queued = False
-                self.changed.notify_all()
+                ticket.at_head.set()
+                if was_head and self.queue:
+                    self.queue[0].at_head.set()
 
     def _completed(self) -> None:
         self.completed += 1
@@ -463,7 +471,7 @@ async def run_workload(
                         termination_reason = "session_pending_overflow"
                         break
                 offered_sessions += 1
-                execution.runner.record_queue("session_pending", queue.qsize())
+                await execution.runner.record_queue("session_pending", queue.qsize())
             else:
                 demand_exhausted = True
                 termination_reason = (
@@ -493,7 +501,7 @@ async def run_workload(
             while True:
                 item = await queue.get()
                 try:
-                    execution.runner.record_queue("session_pending", queue.qsize())
+                    await execution.runner.record_queue("session_pending", queue.qsize())
                     if item is stop:
                         return
                     session, admission = item
@@ -517,7 +525,7 @@ async def run_workload(
                 while True:
                     item = await queue.get()
                     queue.task_done()
-                    execution.runner.record_queue("session_pending", queue.qsize())
+                    await execution.runner.record_queue("session_pending", queue.qsize())
                     if item is stop:
                         break
                     session, admission = item

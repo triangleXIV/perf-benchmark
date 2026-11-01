@@ -201,7 +201,13 @@ class SQLiteResultReader:
         )
         if not rows:
             raise ValueError(f"run not found: {run_id}")
-        return RunSummary(**dict(rows[0]))
+        result = RunSummary(**dict(rows[0]))
+        retention = self.measurements(run_id, scope='run', scope_id=run_id).get('result_retention', {})
+        if retention.get('summary_only'):
+            counts = self._rows('SELECT coalesce(sum(session_count),0),coalesce(sum(turn_count),0) '
+                                'FROM trials WHERE run_id=?', (run_id,))[0]
+            result['session_count'], result['turn_count'] = counts
+        return result
 
     def run_record(self, run_id: str) -> RunRecord:
         rows = self._rows("SELECT * FROM runs WHERE run_id=?", (run_id,))
@@ -590,11 +596,13 @@ class SQLiteResultReader:
 
 
 class _SQLiteBackend:
-    def __init__(self, path: Path, run: RunRecord) -> None:
+    def __init__(self, path: Path, run: RunRecord, *, summary_only=False) -> None:
         self.path, self.run = path, run
         self.connection: sqlite3.Connection | None = None
         self.finalized = False
         self.writer_lease = None
+        from .summary_retention import SummaryRetention
+        self.retention = SummaryRetention(path) if summary_only else None
 
     @property
     def artifact(self) -> SaverArtifact:
@@ -640,8 +648,15 @@ class _SQLiteBackend:
                 f" ON CONFLICT({primary}) DO UPDATE SET {updates},revision=excluded.revision WHERE " + " OR ".join(
                     f"{table}.{c[1]} IS NOT excluded.{c[1]}" for c in columns if not c[5]),
             )
+        if self.retention is not None:
+            self.write_batch((MeasurementRecord(self.run.id, 'run', self.run.id, 'result_retention',
+                                               {'summary_only': True, 'request_details_retained': False}),))
 
     def write_batch(self, records: Sequence[ResultRecord]) -> ResultCommit | None:
+        if self.retention is not None:
+            records = self.retention.filter(records)
+            if not records:
+                return None
         rows: dict[str, list[tuple]] = defaultdict(list)
         entities = []
         for item in records:
@@ -675,6 +690,9 @@ class _SQLiteBackend:
 
     def finalize(self, run: RunRecord) -> SQLiteResultReader:
         assert self.connection is not None
+        if self.retention is not None:
+            self.write_batch((MeasurementRecord(run.id, 'run', run.id, 'request_summary',
+                {'counts': dict(self.retention.counts), 'attempt_errors': dict(self.retention.errors)}),))
         before = self.connection.total_changes
         with self.connection:
             revision = self.connection.execute("UPDATE result_state SET revision=revision+1 WHERE id=1 RETURNING revision").fetchone()[0]
@@ -686,7 +704,10 @@ class _SQLiteBackend:
             if self.connection.total_changes == before + 1:
                 self.connection.execute("UPDATE result_state SET revision=revision-1 WHERE id=1")
         self.run, self.finalized = run, True
-        return SQLiteResultReader(self.path)
+        reader = SQLiteResultReader(self.path)
+        if self.retention is not None:
+            self.retention.finalize(reader, run.id)
+        return reader
 
     def close(self) -> None:
         if self.connection is not None:
@@ -699,13 +720,16 @@ class _SQLiteBackend:
 
 
 def parse_settings(settings: dict) -> dict:
-    unknown = set(settings) - {"path"}
+    unknown = set(settings) - {"path", "summary_only"}
     if unknown:
         raise ValueError(f"unknown sqlite saver setting: {sorted(unknown)[0]}")
     value = settings.get("path")
     if not isinstance(value, str) or not value:
         raise ValueError("saver path is required")
-    return {"path": value}
+    summary_only = settings.get('summary_only', False)
+    if type(summary_only) is not bool:
+        raise ValueError('saver summary_only must be boolean')
+    return {"path": value, "summary_only": summary_only}
 
 
 @register_plugin(
@@ -727,12 +751,13 @@ class SQLiteSaver:
 
     def __init__(self, settings) -> None:
         self.path = str(settings["path"])
+        self.summary_only = settings.get('summary_only', False)
 
     def create_backend(self, run: RunRecord, ctx: SaverContext) -> SaverBackend:
         path = Path(self.path).expanduser()
         if not path.is_absolute():
             path = ctx.base_dir / path
-        return _SQLiteBackend(path, run)
+        return _SQLiteBackend(path, run, summary_only=self.summary_only)
 
 
 def _run_row(run: RunRecord) -> tuple:

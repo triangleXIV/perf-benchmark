@@ -210,6 +210,11 @@ def _seal(source):
                 files.extend(_encode(db, table, tier, temporary / tier / (table + '.parquet')) for table in tables)
             counts = {table: db.execute(f'SELECT count(*) FROM {table}').fetchone()[0]
                       for table in ('trials', 'sessions', 'turns', 'metric_points')}
+            retention = db.execute("SELECT value_json FROM measurements WHERE scope='run' "
+                                   "AND name='result_retention'").fetchone()
+            if retention and orjson.loads(retention[0]).get('summary_only'):
+                counts['sessions'], counts['turns'] = db.execute(
+                    'SELECT coalesce(sum(session_count),0),coalesce(sum(turn_count),0) FROM trials').fetchone()
             totals = pa.Table.from_pylist([{'run_id': run_id, **counts}], schema=pa.schema([
                 ('run_id', pa.string()), *((name, pa.int64()) for name in counts)]))
             totals_path = temporary / 'summary' / 'run_totals.parquet'

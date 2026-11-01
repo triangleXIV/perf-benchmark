@@ -75,7 +75,7 @@ class _Trials:
             async def cancel(self, session, reason):
                 pass
 
-            def record_queue(self, kind, value):
+            async def record_queue(self, kind, value):
                 pass
 
             def record_scheduling(self, fact):

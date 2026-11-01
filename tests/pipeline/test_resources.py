@@ -558,7 +558,7 @@ async def test_scheduler_drains_workers_before_rethrowing_original_failure():
         async def cancel(self, session, reason):
             pass
 
-        def record_queue(self, kind, value):
+        async def record_queue(self, kind, value):
             pass
 
         def record_scheduling(self, fact):
@@ -621,7 +621,7 @@ async def test_scheduler_drain_cancels_blocked_producer_without_waiting_for_stop
         async def cancel(self, session, reason):
             pass
 
-        def record_queue(self, kind, value):
+        async def record_queue(self, kind, value):
             pass
 
         def record_scheduling(self, fact):

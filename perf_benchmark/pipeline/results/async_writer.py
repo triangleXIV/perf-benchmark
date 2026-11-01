@@ -4,7 +4,7 @@ from collections.abc import Callable, Collection
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from queue import Empty, Queue
-from threading import Lock
+from threading import Event as ThreadEvent, Lock
 from time import monotonic, perf_counter
 from typing import Generic, TypeVar
 
@@ -49,6 +49,7 @@ class AsyncBatchWriter(Generic[_Published]):
         self.processing = self.processed = self.batch_seconds = 0
         self.submit_lock = Lock()
         self.headroom = asyncio.Event()
+        self.capacity_ready = ThreadEvent()
 
     def enable_diagnostics(self) -> DiagnosticSource:
         self._observed = True
@@ -76,12 +77,14 @@ class AsyncBatchWriter(Generic[_Published]):
         # Leave room for a wave of terminal facts before admitting more work.
         limit = max(1, self.queue.maxsize // 4)
         while True:
+            # Clear before checking: the worker may finish on another thread
+            # between the check and the await. Never erase its notification.
+            self.headroom.clear()
             self._raise_error()
             if self.closed:
                 raise RuntimeError("batch writer is closed")
             if self.queue.unfinished_tasks < limit:
                 return
-            self.headroom.clear()
             await self.headroom.wait()
 
     def submit_many(self, items: Collection[object]) -> None:
@@ -91,7 +94,9 @@ class AsyncBatchWriter(Generic[_Published]):
         with self.submit_lock:
             if self.queue.unfinished_tasks + len(items) > self.queue.maxsize:
                 self.rejection = BatchWriterOverloaded(
-                    "background writer queue is full; measurement is invalid"
+                    "background writer queue is full; measurement is invalid "
+                    f"(backend={type(self.backend).__name__}, pending={self.queue.unfinished_tasks}, "
+                    f"incoming={len(items)}, capacity={self.queue.maxsize})"
                 )
                 if self.on_error is not None and self.loop is not None:
                     self.loop.call_soon_threadsafe(self.on_error, str(self.rejection))
@@ -99,6 +104,34 @@ class AsyncBatchWriter(Generic[_Published]):
                 raise self.rejection
             for item in items:
                 self.queue.put_nowait(item)
+        self._raise_error()
+
+    def submit_many_wait(self, items: Collection[object]) -> None:
+        """Reliable handoff between background writers, with bounded storage.
+
+        A direct call on the event loop retains nonblocking overload semantics.
+        HTTP completion facts continue to use submit()/submit_many().
+        """
+        if len(items) > self.queue.maxsize:
+            raise ValueError("handoff batch exceeds writer capacity")
+        while True:
+            # Clear before checking, just as in the asynchronous admission path.
+            self.capacity_ready.clear()
+            with self.submit_lock:
+                self._raise_error()
+                if self.closed:
+                    raise RuntimeError("batch writer is closed")
+                if self.queue.unfinished_tasks + len(items) <= self.queue.maxsize:
+                    for item in items:
+                        self.queue.put_nowait(item)
+                    break
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                self.capacity_ready.wait()
+            else:
+                self.submit_many(items)
+                return
         self._raise_error()
 
     async def flush(self) -> None:
@@ -116,7 +149,7 @@ class AsyncBatchWriter(Generic[_Published]):
         if self.closed:
             return
         self.closed = True
-        self.headroom.set()
+        self._wake_waiters()
         failure: BaseException | None = None
         try:
             await self.flush()
@@ -169,6 +202,7 @@ class AsyncBatchWriter(Generic[_Published]):
         finally:
             for _ in batch:
                 self.queue.task_done()
+            self.capacity_ready.set()
             if self.queue.unfinished_tasks < max(1, self.queue.maxsize // 4):
                 self._wake_waiters()
 
@@ -183,6 +217,7 @@ class AsyncBatchWriter(Generic[_Published]):
             command.future.set_exception(exc)
         finally:
             self.queue.task_done()
+            self.capacity_ready.set()
             if self.queue.unfinished_tasks < max(1, self.queue.maxsize // 4):
                 self._wake_waiters()
 
@@ -198,6 +233,7 @@ class AsyncBatchWriter(Generic[_Published]):
             self.processing = 0
 
     def _wake_waiters(self):
+        self.capacity_ready.set()
         if self.loop is not None:
             self.loop.call_soon_threadsafe(self.headroom.set)
 

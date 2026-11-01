@@ -84,6 +84,7 @@ loader
 
 - 统一管理 runtime prepare、Turn 执行、取消、metrics 记录、增量持久化和 runtime close。
 - 同一个 Session 中的 Turn 必须串行执行。
+- FIFO 请求准入只通知下一张可放行票据；大活跃池下不能对每次入队/出队广播唤醒全部等待者。取消队首须通知后继；取消、重试、过载及并发额度回收保持原有语义。
 - Scheduler 通过 TurnControl.send/retry/cancel 和 next_turn 决定下一步操作。待执行的 Turn 保持 pending；已准入或执行的 Turn 按真实终态持久化。
 - Attempt 是 (turn_id, attempt_no) 标识的执行事实；最终 Attempt 决定 Turn 主指标，所有 Attempt 独立记录。预期场景结果与原始请求事实分别记录。
 - 在并发执行时安全聚合 Session 和 Trial 的终态。
@@ -149,6 +150,10 @@ Hook 提供可选的受控拦截与观察能力。仅 `run.before_start` 和 `tr
 - Metrics 与 Saver 的输入队列各固定为 8,192 条记录，按实际记录计数，容量独立于 Scheduler 配置；每批最多 100 条，首条到达后最多等待 100 ms 组批。
 - 数据库 writer 必须由单线程独占；SQLite 每批提交事务。队列容量包含正在处理的记录；余量等待由完成、故障或关闭事件通知。`flush()` 等待排队、处理和结果转交；Saver 的 flush 还确认提交完成。
 - 队列过载或 writer 故障必须使 Run 失败，保留已提交结果，并如实报告事实交接失败。
+- 用户明确选择 `saver.settings.summary_only=true` 的容量测试只保留聚合指标、实际计数和有界错误分类，不保存 Session/Turn/Attempt 明细；逐请求批次不执行 SQLite 事务。关键汇总保存在小型结果库和 `.summary.json`，实时计数每10秒原子更新，最终分位数仍由标准 Metrics 计算。普通模式默认完整保留；汇总模式必须标明无逐请求回溯，读取器与封存计数使用 Trial 的真实完成计数。
+- Session 启动持久化在请求发送前等待 Saver 队列余量，然后不再挂起地提交；A 大于8192时也不能仅因启动突发溢出。请求终态事实仍采用原有的非阻塞提交与过载失败语义。等待通知须先清除事件再检查队列条件，避免丢失后台线程的完成通知。
+- Metrics writer 向 Saver writer 发布结果时，在 Metrics 后台线程等待足够容量，以最多100条的批次可靠交接；不阻塞事件循环、不增加队列上限、不丢弃记录。调度队列与并发占用变化在HTTP计时区间之外等待两级writer余量，保留变化发生时的原始时间戳；完成通知、故障与关闭都必须唤醒跨线程等待者。
+- `PERF_BENCHMARK_PREPARED_CACHE` 可为固定本地 SWE JSON/Parquet、open-swe-traces、all 组合启用 sealed 准备复用。缓存身份覆盖源文件SHA256、准备设置、seed、实现和依赖版本；C/A、结果路径与Run身份不影响正文复用。正文直接写入命名文件，Arrow索引和manifest在准备及校验完成后原子发布，复用时只读mmap正文、校验文件状态和索引SHA256并重绑定Run身份。失败或取消的未完成准备不发布；缓存独立于结果和模型KV缓存，不自动清除旧版本，磁盘预算由部署入口检查。
 - HTTP 接收时间戳在 transport 从客户端库取得原始 bytes 时立即记录，早于 JSON/SSE 解析和 Hook 分发；该时间戳表示应用从客户端库读取原始 bytes 的时刻。
 - 压测正文由临时 BlobStore、当前请求的准备/传输/解码资源及当前 live Session 私有内存按生命周期持有并释放；领域对象、Hook、日志和 SQLite 只保存元数据或测量事实。离线命令的正文处理与输出遵循其独立契约。
 - TTFT、ITL、TPOT 和 E2E 使用传输层原始时间戳计算，解析、Hook 和数据库在测量区间外处理。
@@ -307,3 +312,5 @@ React 工作台从统一 ResultReader 读取正式指标；前端静态资源由
 删除过时说明前将仍有效的契约或操作合并到指南；第三方许可证和来源声明保留。
 
 完整开发仓库保留全部测试，源码交付用 `git archive` 并遵守 `.gitattributes` 的 `export-ignore` 清单，仅同步核心回归测试及其依赖。收件人获得 Python/Rust、前端源码和构建配置，在实际运行环境构建原生扩展、前端资源和安装包。
+
+调度器的`SessionRunner.record_queue`为异步接口，所有生产、消费、stop和因果预留路径必须等待指标队列余量。队列变化的时间和值在等待前捕获，保留原始调度事实；该等待不位于HTTP计时区间。高活跃会话验收必须覆盖真实producer/worker队列事件，不能只测试Saver会话记录突发。

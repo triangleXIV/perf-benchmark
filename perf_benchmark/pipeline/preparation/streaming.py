@@ -51,6 +51,7 @@ from perf_benchmark.pipeline.contracts.normalization import (
     RecordNormalizationPlugin,
     TokenTexts,
     TurnDraft,
+    compact_json_bytes,
     compact_json_text,
     resolve_token,
     token_plan,
@@ -259,7 +260,7 @@ def _normalized_row(
         ("extra_headers", draft.extra_headers or None),
         ("recorded_response", draft.recorded_response),
     ):
-        ref = payloads.append(compact_json_text(value).encode()) if name == "request" or value is not None else None
+        ref = payloads.append(compact_json_bytes(value)) if name == "request" or value is not None else None
         row[f"{name}_payload_offset"] = ref.offset if ref else None
         row[f"{name}_payload_bytes"] = ref.byte_length if ref else None
     for name in ("profile", "recorded_profile"):
@@ -517,24 +518,36 @@ class PreparedCorpus:
             for stage, contract in zip(_DATA_STAGES, (LoaderPlugin, NormalizationPlugin, SelectorPlugin)):
                 if not isinstance(plugins[stage], contract):
                     raise TypeError(f"bound {stage} does not implement {contract.__name__}")
-            loader = LoaderHost(cast(LoaderPlugin, plugins["loader"]), events=ctx.events)
-            normalizer = NormalizationHost(
-                cast(NormalizationPlugin, plugins["normalization"]),
-                run_id=run.id,
-                payloads=ctx.payloads,
-                events=ctx.events,
-            )
-            selector = SelectorHost(cast(SelectorPlugin, plugins["selector"]), events=ctx.events)
-            await lifecycle.start("loader")
-            source = await loader.open(LoaderContext(ctx.base_dir, ctx.cancellation))
-            own(resources, source.close)
-            await lifecycle.start("normalization")
-            normalized = normalizer.transform(source, NormalizationContext(ctx.base_dir, ctx.cancellation, ctx.seed))
-            own(resources, normalized.aclose)
-            await lifecycle.start("selector")
-            selected = await selector.select(normalized, SelectorContext(ctx.cancellation))
-            run.counts.update(selected.counts)
-            run.counts["source_rows"] = source.rows_read
+            from perf_benchmark.pipeline.preparation.cache import PreparedCache
+            cache = await asyncio.to_thread(PreparedCache.open, ctx)
+            cached = None
+            if cache is not None:
+                resources.callback(cache.close)
+                cached = await asyncio.to_thread(cache.load, ctx.payloads, run.id)
+            if cached is not None:
+                for stage in _DATA_STAGES:
+                    await lifecycle.start(stage)
+                selected = SelectedDataset(cached[0], MappingProxyType(cached[1]))
+                run.counts.update(selected.counts)
+            else:
+                loader = LoaderHost(cast(LoaderPlugin, plugins["loader"]), events=ctx.events)
+                normalizer = NormalizationHost(
+                    cast(NormalizationPlugin, plugins["normalization"]),
+                    run_id=run.id,
+                    payloads=ctx.payloads,
+                    events=ctx.events,
+                )
+                selector = SelectorHost(cast(SelectorPlugin, plugins["selector"]), events=ctx.events)
+                await lifecycle.start("loader")
+                source = await loader.open(LoaderContext(ctx.base_dir, ctx.cancellation))
+                own(resources, source.close)
+                await lifecycle.start("normalization")
+                normalized = normalizer.transform(source, NormalizationContext(ctx.base_dir, ctx.cancellation, ctx.seed))
+                own(resources, normalized.aclose)
+                await lifecycle.start("selector")
+                selected = await selector.select(normalized, SelectorContext(ctx.cancellation))
+                run.counts.update(selected.counts)
+                run.counts["source_rows"] = source.rows_read
             ctx.payloads.seal()
             plans: tuple[_SessionPlan, ...] = ()
             if not ctx.cancellation.is_cancelled():
@@ -542,11 +555,13 @@ class PreparedCorpus:
                     _decode_session_plans,
                     selected.batches,
                 )
-            await lifecycle.finish(*_DATA_STAGES,
-                                   outcome="cancelled" if ctx.cancellation.is_cancelled() else "completed")
             self.plans = plans
             self.turn_count = sum(len(plan.turns) for plan in plans)
             self.max_graph_branches = _validate_causal_plans(plans)
+            if cache is not None and cached is None and not ctx.cancellation.is_cancelled():
+                await asyncio.to_thread(cache.publish, selected.batches, run.counts, run.id)
+            await lifecycle.finish(*_DATA_STAGES,
+                                   outcome="cancelled" if ctx.cancellation.is_cancelled() else "completed")
         except BaseException as exc:
             await lifecycle.finish(*_DATA_STAGES, outcome="failed", error=f"{type(exc).__name__}: {exc}")
             raise

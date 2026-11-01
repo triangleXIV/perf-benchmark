@@ -1181,3 +1181,29 @@ XLSX 导出使用单次流式读取，写入时同步计算精确列宽，当前
 unknown setting 先检查 Stage/settings 位置；超时区分单请求、单 Trial 和搜索总预算。
 缓存缺失先检查原始 usage 与服务报告开关，数值以原始响应为准；输入慢先区分客户端准备和服务等待。
 检查运行状态、失败/取消、SLO、unavailable reason 后再比较性能。
+
+
+### 大会话池的准备缓存和关键指标模式
+
+固定本地 SWE JSON/Parquet、`open-swe-traces` 和 `all` 组合可以设置
+`PERF_BENCHMARK_PREPARED_CACHE=/absolute/path/to/prepared-cache`，复用已经封存的正文与索引。
+源文件、seed、准备设置、实现和依赖版本共同决定身份；修改 C/A 或结果路径不重新准备。
+未完成或校验失败的缓存不复用。这个缓存只保存客户端请求正文，与服务端 KV、分词或路由缓存无关；正式冷启动测试仍需在打流前清空服务端缓存。调用方负责缓存目录的磁盘预算及旧版本归档。
+
+容量测试只需关键指标时，可显式配置：
+
+```yaml
+pipeline:
+  saver:
+    plugin: sqlite
+    settings:
+      path: results/capacity.db
+      summary_only: true
+```
+
+该模式不保存 Session/Turn/Attempt 明细，仍由标准 Metrics 计算精确分位数、吞吐、用量和失败统计。
+小型 SQLite 保存元数据和聚合指标；同路径的 `.summary.json` 每10秒原子更新计数，结束时保存完整汇总。
+错误分类有界；该模式没有逐请求回溯。默认模式继续保存完整事实。
+
+若单个 Python 调度进程成为瓶颈，可使用 [分片客户端示例](../benchmarks/sharded-clients.md)，
+在多个 CPU 进程中运行现有 pipeline，并合并数值样本计算全局分位数。

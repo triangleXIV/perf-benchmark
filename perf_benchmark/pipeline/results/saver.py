@@ -113,7 +113,7 @@ class SaverRuntime:
         self.writer.submit(MeasurementRecord(self.run.id, "run", self.run.id, name, _freeze(value)))
 
     def write_results(self, batch: ComputedResultBatch) -> None:
-        self.writer.submit_many(
+        records = (
             batch.turns + batch.sessions + batch.attempts
             + tuple(record for series in batch.series for record in (
                 _snapshot(MetricWindowResultRecord, series.window, run_id=self.run.id,
@@ -121,8 +121,17 @@ class SaverRuntime:
                 *(_snapshot(MetricPoint, point) for point in series.points),
             ))
         )
+        # Metrics publishes from its own writer thread. Wait on that thread
+        # when Session starts or earlier batches occupy the Saver queue.
+        source = iter(records)
+        while chunk := tuple(islice(source, 100)):
+            self.writer.submit_many_wait(chunk)
 
     async def write_session(self, session: Session) -> None:
+        # Session admission can emit more starts than the entire result queue
+        # before any HTTP request runs. Wait here, outside request timing, and
+        # submit without another suspension so concurrent admissions recheck.
+        await self.writer.wait_for_headroom()
         self.writer.submit(_snapshot(SessionResultRecord, session, turn_count=len(session.turns)))
 
     async def write_trial(self, trial: Trial, fact: TrialFact | None = None) -> None:

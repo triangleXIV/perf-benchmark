@@ -147,7 +147,7 @@ class TraceCausalScheduler(SchedulerPlugin):
             done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 reserved -= active.pop(task)
-                runner.record_queue("reserved_sessions", reserved)
+                await runner.record_queue("reserved_sessions", reserved)
                 await task
 
         async def submit(sessions):
@@ -173,7 +173,7 @@ class TraceCausalScheduler(SchedulerPlugin):
                 return
             reserved += len(sessions)
             admitted += len(sessions)
-            runner.record_queue("reserved_sessions", reserved)
+            await runner.record_queue("reserved_sessions", reserved)
             active[asyncio.create_task(run_graph(sessions, due))] = len(sessions)
 
         buffered, graph_id = [], None
@@ -195,7 +195,7 @@ class TraceCausalScheduler(SchedulerPlugin):
                 for task in active:
                     task.cancel()
                 await asyncio.gather(*active, return_exceptions=True)
-            runner.record_queue("reserved_sessions", 0)
+            await runner.record_queue("reserved_sessions", 0)
             runner.record_scheduling(TrialSchedulingFact(
                 offered_sessions=admitted, admitted_sessions=completed, completed_sessions=completed,
                 offered_attempts=strategy.attempts.offered, admitted_attempts=strategy.attempts.admitted,

@@ -345,7 +345,7 @@ async def test_all_scheduler_axes_use_public_runner_and_outcomes(name, settings,
                         lease.release()
                 async def cancel(self, session, reason):
                     pass
-                def record_queue(self, kind, value):
+                async def record_queue(self, kind, value):
                     pass
                 def record_scheduling(self, fact):
                     facts.append(fact)

@@ -321,6 +321,10 @@ class ExecutionEngine:
         self.occupancy[kind] += delta
         value = self.occupancy[kind]
         at_ns = perf_counter_ns()
+        # Scheduling transitions may wait outside the raw HTTP timing window.
+        # Recheck both writers here, including after a simultaneous completion
+        # wave, before emitting nonblocking Attempt/Turn/Session facts.
+        await self.metrics.wait_for_headroom()
         self.metrics.record_occupancy(kind, at_ns, value)
         await self._scheduler_event(
             lifecycle.SCHEDULER_CONCURRENCY_CHANGED,
@@ -328,9 +332,13 @@ class ExecutionEngine:
             data={"kind": kind, "value": value},
         )
 
-    def record_queue(self, kind: str, value: int) -> None:
+    async def record_queue(self, kind: str, value: int) -> None:
+        # Queue transitions are scheduling facts, outside HTTP timing. Preserve
+        # their original timestamp/value while waiting for reliable delivery.
+        at_ns = perf_counter_ns()
         self.occupancy[kind] = value
-        self.metrics.record_occupancy(kind, perf_counter_ns(), value)
+        await self.metrics.wait_for_headroom()
+        self.metrics.record_occupancy(kind, at_ns, value)
 
     def record_scheduling(self, fact: TrialSchedulingFact) -> None:
         if self.scheduling_fact is not None:

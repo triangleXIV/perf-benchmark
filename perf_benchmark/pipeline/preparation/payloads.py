@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import mmap
+from pathlib import Path
 import tempfile
 import weakref
 
@@ -31,6 +32,18 @@ class BlobStore:
         self._mapping: mmap.mmap | None = None
         self._sealed = False
         self._closed = False
+
+    def use_file(self, path: Path, *, existing: bool = False) -> None:
+        """Use a named preparation artifact without copying its payload bytes."""
+        self._ensure_open()
+        if self._size or self._sealed:
+            raise RuntimeError("cannot replace a populated blob store")
+        stream = path.open("rb" if existing else "x+b")
+        self._stream.close()
+        self._stream = stream
+        self._size = path.stat().st_size
+        if existing:
+            self.seal()
 
     def append(self, data: bytes) -> PayloadRef:
         self._ensure_open()
