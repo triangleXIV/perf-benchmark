@@ -65,3 +65,9 @@ headers, or request IDs. Each shard retains its complete standard maxTPM and oth
 window metrics. The current global summary does not reconstruct a synchronized
 maxTPM window; do not sum shard peaks or present the global summary as a full
 replacement for the per-shard reports.
+
+The compact StandardMetrics tables use milliseconds for TTFT/TPOT/E2E/ITL;
+the global JSON converts them to explicitly named seconds. Native per-shard
+reports retain their original public units (for example TPOT/ITL in ms).
+Inverse ITL is labeled events/s: a protocol output event can contain multiple
+speculative tokens, so it cannot be advertised as per-user token throughput.

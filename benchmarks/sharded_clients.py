@@ -209,7 +209,8 @@ def final_summary(spec):
     }
     for name in ("ttft", "tpot", "e2e"):
         row = db.execute(
-            f"SELECT count({name}),avg({name}),quantile_cont({name},[.5,.9,.99]) "
+            # StandardMetrics' private numeric tables store latencies in ms.
+            f"SELECT count({name}),avg({name}/1000.),quantile_cont({name}/1000.,[.5,.9,.99]) "
             "FROM samples WHERE status='succeeded'"
         ).fetchone()
         result["latency_seconds"][name] = {
@@ -218,7 +219,9 @@ def final_summary(spec):
             **dict(zip(("p50", "p90", "p99"), row[2] or [None] * 3)),
         }
     totals = db.execute(
-        "SELECT sum(prompt),sum(completion),sum(cached),sum(decode_tokens),sum(decode_ns) "
+        "SELECT sum(prompt),sum(completion),sum(cached),"
+        "sum(decode_tokens) FILTER(WHERE decode_tokens>0 AND decode_ns>0),"
+        "sum(decode_ns) FILTER(WHERE decode_tokens>0 AND decode_ns>0) "
         "FROM samples WHERE status='succeeded'"
     ).fetchone()
     result["tokens"] = dict(zip(("prompt", "output", "cached_prompt"), totals[:3]))
@@ -230,13 +233,13 @@ def final_summary(spec):
     if all(Path(p).exists() for p in itl):
         db.read_parquet(itl).create_view("itl_samples")
         row = db.execute(
-            "SELECT count(*),quantile_cont(value,[.5,.9,.99]) FROM itl_samples"
+            "SELECT count(*),quantile_cont(value/1000.,[.5,.9,.99]) FROM itl_samples"
         ).fetchone()
         result["itl_seconds"] = {
             "samples": row[0],
             **dict(zip(("p50", "p90", "p99"), row[1] or [None] * 3)),
         }
-        result["inverse_p90_itl_tok_s"] = 1 / row[1][1] if row[1] and row[1][1] > 0 else None
+        result["inverse_p90_itl_events_s"] = 1 / row[1][1] if row[1] and row[1][1] > 0 else None
     occupancy = [str(output / f"worker-{i}/concurrency.parquet") for i in range(spec["workers"])]
     if all(Path(p).exists() for p in occupancy):
         db.read_parquet(occupancy, filename=True).create_view("occupancy_samples")

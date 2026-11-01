@@ -42,9 +42,9 @@ def test_pooled_quantiles_use_numeric_samples_and_global_concurrency(tmp_path):
         "prompt": 100,
         "completion": 11,
         "cached": 80,
-        "ttft": 0.1,
-        "tpot": 0.02,
-        "e2e": 1.0,
+        "ttft": 100.0,
+        "tpot": 20.0,
+        "e2e": 1000.0,
         "decode_tokens": 10,
         "decode_ns": 200_000_000,
     }
@@ -57,16 +57,16 @@ def test_pooled_quantiles_use_numeric_samples_and_global_concurrency(tmp_path):
             else {
                 **base,
                 "completion": 21,
-                "ttft": 0.3,
-                "tpot": 0.04,
-                "e2e": 2.0,
+                "ttft": 300.0,
+                "tpot": 40.0,
+                "e2e": 2000.0,
                 "decode_tokens": 20,
                 "decode_ns": 800_000_000,
             }
         )
         pq.write_table(pa.Table.from_pylist([row]), p / "key-samples.parquet")
         pq.write_table(
-            pa.table({"value": [0.01, 0.02] if i == 0 else [0.03, 0.04]}), p / "itl-samples.parquet"
+            pa.table({"value": [10.0, 20.0] if i == 0 else [30.0, 40.0]}), p / "itl-samples.parquet"
         )
         pq.write_table(
             pa.table({"kind": ["in_flight"] * 2, "at_ns": [1 + i, 5 + i], "value": [2, 0]}),
@@ -109,3 +109,46 @@ def test_latency_previews_pool_sums_and_keep_missing_samples_unknown():
     assert value["e2e_mean_s"] is None and value["e2e_samples"] == 0
     assert value["decode_time_weighted_tok_s"] == 40
     assert value["latency_workers_available"] == 2 and value["latency_workers_expected"] == 3
+
+
+def test_final_summary_converts_native_milliseconds_and_uses_same_decode_cohort(tmp_path):
+    from perf_benchmark.plugins.metrics.standard.formulas import request_values, itl_values
+
+    fact = SimpleNamespace(
+        response_mode="stream",
+        output_kind="text",
+        request_ns=1_000_000_000,
+        first_ns=1_100_000_000,
+        last_ns=1_300_000_000,
+        response_completed_ns=1_400_000_000,
+        output_event_count=2,
+        usage={"prompt_tokens": 100, "completion_tokens": 11},
+        turn_completed_ns=1_400_000_000,
+        total_started_ns=1_000_000_000,
+        response_samples=((0, 1_100_000_000), (1, 1_300_000_000)),
+    )
+    values = request_values(fact)
+    row = {
+        "status": "succeeded",
+        "request_ns": fact.request_ns,
+        "response_completed_ns": fact.response_completed_ns,
+        "prompt": 100,
+        "completion": 11,
+        "cached": 0,
+        **{name: values[name] for name in ("ttft", "tpot", "e2e", "decode_tokens", "decode_ns")},
+    }
+    worker = tmp_path / "worker-0"
+    worker.mkdir()
+    # A successful response with missing decode timing must not add token weight.
+    missing = {**row, "completion": 101, "decode_tokens": 100, "decode_ns": None}
+    pq.write_table(pa.Table.from_pylist([row, missing]), worker / "key-samples.parquet")
+    pq.write_table(pa.table({"value": list(itl_values(fact))}), worker / "itl-samples.parquet")
+    result = final_summary(
+        {"output": str(tmp_path), "workers": 1, "concurrency": 1, "active_users": 1}
+    )
+    assert result["latency_seconds"]["ttft"]["p90"] == pytest.approx(0.1)
+    assert result["latency_seconds"]["tpot"]["p90"] == pytest.approx(0.02)
+    assert result["latency_seconds"]["e2e"]["p90"] == pytest.approx(0.4)
+    assert result["itl_seconds"]["p90"] == pytest.approx(0.2)
+    assert result["inverse_p90_itl_events_s"] == pytest.approx(5.0)
+    assert result["decode_time_weighted_tok_s"] == pytest.approx(50.0)
